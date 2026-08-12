@@ -1,0 +1,74 @@
+#!/bin/bash
+set -e
+
+# Ensure a working `docker` + `docker compose` on the host. There are
+# two ways Docker gets installed on Ubuntu, and they DO NOT mix:
+#
+#   * Ubuntu's own package    docker.io  + docker-compose-v2
+#   * Docker Inc's apt repo   docker-ce  + docker-compose-plugin
+#
+# `docker-compose-v2` declares `Depends: docker.io`, so blindly
+# `apt-get install docker-compose-v2` on a box that already has
+# docker-ce fails with:
+#   docker-compose-v2 : Depends: docker.io but it is not going to
+#   be installed
+# because apt refuses to add docker.io alongside the conflicting
+# docker-ce. ../impala/install has the same bug — same shape, same
+# fix belongs there too, but leave that folder alone for now.
+#
+# Strategy: (1) if `docker compose` already works, do nothing — the
+# host is already set up either way. (2) Otherwise decide which
+# flavour to install based on what's already there. (3) Only fall
+# back to `docker.io + docker-compose-v2` when nothing docker-shaped
+# is present.
+
+need_compose_install=1
+if command -v docker >/dev/null 2>&1 \
+   && docker compose version >/dev/null 2>&1; then
+    need_compose_install=0
+fi
+
+if [ "$need_compose_install" = 1 ]; then
+    sudo apt-get update -y
+    if dpkg -l 2>/dev/null | grep -q '^ii  docker-ce '; then
+        # Docker Inc's repo is present — install its compose plugin,
+        # not Ubuntu's, so we don't drag in a docker.io conflict.
+        sudo apt-get install -y docker-compose-plugin
+    elif dpkg -l 2>/dev/null | grep -q '^ii  docker\.io '; then
+        # Ubuntu docker is present — its compose plugin is safe.
+        sudo apt-get install -y docker-compose-v2
+    else
+        # Nothing docker-shaped installed. Prefer Ubuntu's packages
+        # because they're one apt-get call and require no third-party
+        # repo. If the user wants docker-ce they can install it first
+        # and re-run.
+        sudo apt-get install -y docker.io docker-compose-v2
+    fi
+fi
+sudo apt-get install -y curl
+
+# Pull all six service images up-front so the first ./start does not
+# include image-pull wall-clock. Two of these (apache/kudu) are not in
+# the ../impala/ pull set.
+sudo docker compose -f docker-compose.yml pull
+
+# Data dir bind-mounted into catalogd + impalad + hms as /clickbench.
+# ./load (Phase 2) will place the Parquet file here to be staged into
+# Kudu via an INSERT ... SELECT.
+mkdir -p data/hits
+
+# jdo-api-3.0.1 workaround for the Impala 4.5.0 quickstart images —
+# same reasoning as ../impala/install. Without this jar in
+# /opt/impala/lib, catalogd and impalad both crash at startup with
+# NoClassDefFoundError: javax.jdo.JDOException.
+JDO_API_VERSION=3.0.1
+mkdir -p data/extra-lib
+if [ ! -f "data/extra-lib/jdo-api-${JDO_API_VERSION}.jar" ]; then
+    curl -fsSL -o "data/extra-lib/jdo-api-${JDO_API_VERSION}.jar" \
+        "https://repo1.maven.org/maven2/javax/jdo/jdo-api/${JDO_API_VERSION}/jdo-api-${JDO_API_VERSION}.jar"
+fi
+
+# Impala daemons run as uid 1000 ("impala"); make the bind-mount
+# writable by that uid. Kudu containers run as their own kudu user and
+# only touch named volumes, so no chown needed there.
+sudo chown -R 1000:1000 data

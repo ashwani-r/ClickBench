@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Same idempotent bring-up as ../impala/start — compose leaves already-
+# running services alone. The dependency graph in docker-compose.yml
+# starts hms + kudu-master-1 first, then catalogd, tserver, impalad-1,
+# and finally the client sidecar.
+sudo docker compose -f docker-compose.yml up -d

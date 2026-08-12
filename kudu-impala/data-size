@@ -1,0 +1,36 @@
+#!/bin/bash
+set -e
+
+# Report the on-disk size (bytes) of the Kudu table. Uses the
+# `kudu table statistics` subcommand, which talks to the master and
+# aggregates per-tablet stats across every tablet server. Available in
+# Kudu >= 1.14; we're on 1.17 in docker-compose.yml so this is fine.
+#
+# Impala names Kudu tables `impala::<db>.<table>` at the Kudu layer
+# (Impala's default managed-table naming convention), so the CLI
+# needs the mangled name, not `clickbench.hits`.
+#
+# Output shape as of Kudu 1.17 (label uses spaces, not underscores;
+# value is the last whitespace-separated field on the line):
+#     TABLE impala::clickbench.hits
+#     on disk size: 43055028633
+#     live row count: 99997497
+#     on disk size limit: N/A
+#     live row count limit: N/A
+# So we anchor on the "on disk size:" prefix (with a trailing colon
+# to disambiguate from "on disk size limit:") and take the last
+# field, which is the byte count.
+#
+# Falls back to error if the row isn't there — better a loud failure
+# than a silent zero that the ClickBench site would publish.
+
+size=$(sudo docker exec -i kudu-impala-master-1 \
+    kudu table statistics kudu-master-1:7051 impala::clickbench.hits \
+    </dev/null | awk '/^on disk size:/ { print $NF; exit }')
+
+if [ -z "$size" ]; then
+    echo "kudu-impala/data-size: could not parse on_disk_size from kudu CLI" >&2
+    exit 1
+fi
+
+echo "$size"

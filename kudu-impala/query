@@ -1,0 +1,20 @@
+#!/bin/bash
+# Reads a SQL query from stdin, runs it via impala-shell in the client
+# sidecar container. Same shape as ../impala/query — impalad-1 is the
+# coordinator for both variants; only the underlying storage differs.
+# Stdout: query result.
+# Stderr: query runtime in fractional seconds on the last line.
+# Exit non-zero on error.
+set -e
+
+query=$(cat)
+
+start=$(date +%s.%N)
+# `< /dev/null`: keep docker exec from forwarding whatever the caller's
+# stdin is. bench_run_query already pipes the query via
+# `printf | ./query` so $(cat) drains stdin above, but explicit is
+# cheaper than a future silent-drain bug.
+sudo docker exec -i kudu-impala-client impala-shell -i impalad-1:21050 -d clickbench -B --quiet -q "$query" < /dev/null
+end=$(date +%s.%N)
+
+awk -v s="$start" -v e="$end" 'BEGIN { printf "%.3f\n", e - s }' >&2

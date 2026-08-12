@@ -1,0 +1,46 @@
+#!/bin/bash
+set -e
+
+# Belt-and-braces cleanup of any orphaned Kudu-side table before we
+# ask Impala to (re)create it. This only matters in the "HMS was
+# wiped between runs" recovery path (see fix-hms-and-retry.sh) — in
+# that case Impala's DROP TABLE IF EXISTS in create.sql sees no HMS
+# row and skips silently, leaving the Kudu-side table alive as an
+# orphan. The next CREATE TABLE then fails with:
+#     ImpalaRuntimeException: Table 'impala::clickbench.hits'
+#     already exists in Kudu.
+# Reaching past Impala and asking Kudu directly to delete the table
+# is idempotent — if it isn't there, `kudu table delete` errors out
+# and we suppress it with `|| true`.
+sudo docker exec kudu-impala-master-1 \
+    kudu table delete kudu-master-1:7051 impala::clickbench.hits \
+    2>/dev/null || true
+
+# Stage the downloaded hits.parquet into the external table's LOCATION
+# (bind-mounted into every impala container as /clickbench). This is
+# only the staging path — after create.sql runs, the data lives in
+# Kudu and the Parquet file can be freed.
+ln -f hits.parquet data/hits/hits.parquet
+sudo chown -R 1000:1000 data
+
+# Apply the DDL + UPSERT via impala-shell in the client sidecar. The
+# create.sql script does everything: creates hits_parquet, creates the
+# Kudu-backed hits table, upserts, computes stats, drops hits_parquet.
+sudo docker cp create.sql kudu-impala-client:/tmp/create.sql
+
+# `< /dev/null`: same reason as ../impala/load and ./query — docker
+# exec -i forwards host stdin to the container even when impala-shell
+# never reads it. If bench_main ever calls ./load while its
+# `while read ... done < queries.sql` redirect is active, docker
+# would drain that fd and the outer loop would silently exit after
+# one query. Explicit /dev/null keeps this script isolated.
+sudo docker exec -i kudu-impala-client \
+    impala-shell -i impalad-1:21050 -B --quiet -f /tmp/create.sql \
+    < /dev/null
+
+# hits_parquet has been dropped by create.sql, but Impala only removed
+# the metastore entry — the file at data/hits/hits.parquet stays.
+# Delete it to reclaim ~14GB of disk that the running benchmark
+# doesn't need. Kudu holds the data now.
+rm -f data/hits/hits.parquet hits.parquet
+sync

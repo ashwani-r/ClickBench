@@ -1,0 +1,68 @@
+#!/bin/bash
+# Readiness probe for the six-service Kudu+Impala stack. All three
+# gates must pass before the driver considers the cluster ready:
+#
+#   1. impalad-1 /healthz on :25000 returns "OK". This proves the
+#      coordinator has registered with statestored and catalogd — same
+#      condition as ../impala/check.
+#   2. kudu master /varz on :8051 returns HTTP 200. The master web UI
+#      only opens once the master has initialized its filesystem and
+#      is serving RPCs, so this doubles as a "master is up" probe.
+#   3. The master reports at least one registered live tablet server.
+#      Without this the master accepts DDL but any INSERT / scan fails
+#      with NotFound: no tablet server available. /tablet-servers?raw=1
+#      returns a plain-text table; grepping for "LIVE" is the cheapest
+#      probe that survives the format staying stable across Kudu 1.15+.
+#
+# On any failure, dump container status + last-50 log lines for every
+# kudu-impala- container to stderr — bench_check_loop surfaces this
+# after its readiness timeout, turning "did not succeed within 900s"
+# into something actionable.
+
+fail() {
+    {
+        printf 'kudu-impala/check: %s\n' "$1"
+        sudo docker ps -a --filter 'name=kudu-impala-' \
+            --format '  {{.Names}}: {{.Status}}'
+        for c in $(sudo docker ps -a --filter 'name=kudu-impala-' \
+                       --format '{{.Names}}'); do
+            echo "--- $c (last 50 log lines) ---"
+            sudo docker logs --tail 50 "$c" 2>&1 | sed 's/^/  /'
+        done
+    } >&2
+    exit 1
+}
+
+# 1. Impala coordinator healthz.
+out=$(curl -sSf -m 5 http://localhost:25000/healthz 2>&1) \
+    || fail "impala /healthz unreachable: $out"
+[ "$out" = "OK" ] || fail "impala /healthz returned: $out"
+
+# 2. Kudu master web UI reachable. /varz is a stable endpoint present
+# in every Kudu release since 1.0; a 200 back means the daemon is
+# serving. Not requiring specific body content keeps this insensitive
+# to upstream cosmetic changes.
+curl -sSf -m 5 -o /dev/null http://localhost:8051/varz \
+    || fail "kudu master /varz unreachable on :8051"
+
+# 3. At least one live tserver registered with the master. Without
+# this an INSERT into a STORED AS KUDU table fails with "no tablet
+# server available", even though catalogd, impalad, and the master
+# all report healthy.
+#
+# The master's /tablet-servers page returns HTML in Kudu 1.17 (the
+# `?raw=1` query param is silently ignored). The one line that's
+# stable across HTML/text variants and versions is:
+#     There are N registered tablet servers.
+# We extract N and require it to be > 0. That count only includes
+# LIVE tservers on the master's endpoint — dead tservers appear in a
+# separate "Dead Tablet Servers" section with its own count line.
+tservers=$(curl -sSf -m 5 'http://localhost:8051/tablet-servers' 2>&1) \
+    || fail "kudu master /tablet-servers unreachable: $tservers"
+count=$(echo "$tservers" \
+    | grep -oE 'There are [0-9]+ registered tablet servers' \
+    | grep -oE '[0-9]+' \
+    | head -1)
+if [ -z "$count" ] || [ "$count" -lt 1 ]; then
+    fail "no LIVE tablet server registered with kudu master (count=${count:-unparsed})"
+fi

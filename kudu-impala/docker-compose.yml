@@ -1,0 +1,332 @@
+# Apache Impala 4 quickstart cluster with Apache Kudu as the storage
+# engine. Adapted from ../impala/docker-compose.yml — same four Impala
+# services (hms, statestored, catalogd, impalad-1) plus a single Kudu
+# master and a single Kudu tablet server on the same user-defined bridge
+# network.
+#
+# Single-master / single-tserver is deliberate: the ClickBench dataset
+# is a single 100M-row table on a single VM, and a multi-master quorum
+# adds no benchmark signal — only wall-clock to first-cold start. The
+# upstream apache/kudu quickstart runs 3 masters + 5 tservers; we
+# collapse both to N=1 for the same reason ../impala/ runs a single
+# combined coordinator+executor instead of separate roles.
+#
+# The impalad-1 service flips its -kudu_master_hosts flag from the
+# empty string (../impala/) to kudu-master-1:7051, which is what lets
+# Impala DDL like STORED AS KUDU actually reach the Kudu master.
+#
+# NOTE (Phase 1 scope): the schema/load path (create.sql, load) still
+# needs to be written for Kudu; only the container topology is in
+# place. `./install && ./start && ./check` should now return an
+# Impala+Kudu cluster that Phase 2 can then populate.
+
+services:
+  hms:
+    image: apache/impala:4.5.0-impala_quickstart_hms
+    container_name: kudu-impala-hms
+    command: ["hms"]
+    volumes:
+      - hms_warehouse:/var/lib/hive
+      - ./data:/clickbench:rw
+      # See ../impala/hms-hive-site.xml — registers DbNotificationListener
+      # so impalad's DDL RPCs to get_current_notificationEventId succeed.
+      - ./hms-hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+    networks:
+      - kudu-impala-net
+    hostname: hms
+
+  statestored:
+    image: apache/impala:4.5.0-statestored
+    container_name: kudu-impala-statestored
+    command: ["-redirect_stdout_stderr=false", "-logtostderr", "-v=1"]
+    networks:
+      - kudu-impala-net
+    hostname: statestored
+
+  catalogd:
+    image: apache/impala:4.5.0-catalogd
+    container_name: kudu-impala-catalogd
+    depends_on:
+      - statestored
+      - hms
+    command:
+      - "-redirect_stdout_stderr=false"
+      - "-logtostderr"
+      - "-v=1"
+      # See ../impala/docker-compose.yml for the full explanation of
+      # hms_event_polling_interval_s=0 and use_resolved_hostname=false.
+      # Same reasoning applies — the quickstart HMS ships without
+      # DbNotificationListener wired by default so polling races the
+      # daemon into a crash loop.
+      - "-hms_event_polling_interval_s=0"
+      - "-invalidate_tables_timeout_s=999999"
+      - "-use_resolved_hostname=false"
+      # Point catalogd at the Kudu master so `CREATE TABLE ... STORED AS
+      # KUDU` can resolve the master through the catalog layer.
+      - "-kudu_master_hosts=kudu-master-1:7051"
+    volumes:
+      - ./data:/clickbench:rw
+      - ./data/extra-lib/jdo-api-3.0.1.jar:/opt/impala/lib/jdo-api-3.0.1.jar:ro
+      - ./hive-site.xml:/opt/impala/conf/hive-site.xml:ro
+    networks:
+      - kudu-impala-net
+    hostname: catalogd
+
+  impalad-1:
+    image: apache/impala:4.5.0-impalad_coord_exec
+    container_name: kudu-impala-impalad-1
+    depends_on:
+      - statestored
+      - catalogd
+      - kudu-master-1
+      - kudu-tserver-1
+    command:
+      - "-v=1"
+      - "-redirect_stdout_stderr=false"
+      - "-logtostderr"
+      # This is the whole point of the kudu-impala variant. ../impala/
+      # passes -kudu_master_hosts= (empty) to explicitly disable Kudu
+      # integration; here we point at the real master.
+      - "-kudu_master_hosts=kudu-master-1:7051"
+      - "-mt_dop_auto_fallback=true"
+      # MT_DOP=8 as a cluster-wide default query option. The ClickBench
+      # scan-heavy queries (full-column scans, string LIKE, GROUP BY on
+      # URL/Title) are the ones where Kudu trails Parquet; those are
+      # single-fragment-per-tablet by default and leave most of the box's
+      # 16 vCPUs idle. Fanning the scan+aggregate out to 8 intra-node
+      # fragments parallelizes them across cores. Set here (not per-query)
+      # so ./query stays a pure timed path with no extra SET round-trip,
+      # and every benchmark query inherits it. mt_dop_auto_fallback above
+      # still lets Impala back off for plan shapes MT_DOP can't handle.
+      - "-default_query_options=MT_DOP=8"
+      # ../impala/ pins Parquet as the default file format because its
+      # `hits` table is Parquet-backed. For Kudu the default file format
+      # is irrelevant (STORED AS KUDU is explicit), so we leave the
+      # daemon default alone.
+      - "-use_resolved_hostname=false"
+    ports:
+      - "21000:21000"
+      - "21050:21050"
+      - "25000:25000"
+    volumes:
+      - ./data:/clickbench:rw
+      - ./data/extra-lib/jdo-api-3.0.1.jar:/opt/impala/lib/jdo-api-3.0.1.jar:ro
+      - ./hive-site.xml:/opt/impala/conf/hive-site.xml:ro
+    networks:
+      - kudu-impala-net
+    hostname: impalad-1
+
+  # impala-shell sidecar — same pattern as ../impala/, used by ./load
+  # and ./query via `docker exec`.
+  client:
+    image: apache/impala:4.5.0-impala_quickstart_client
+    container_name: kudu-impala-client
+    depends_on:
+      - impalad-1
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      - kudu-impala-net
+
+  # Kudu master. Single-master mode is not the upstream production
+  # recommendation (the quickstart uses 3), but for a single-VM
+  # benchmark the fault-tolerance quorum adds only start-up latency.
+  #
+  # --use_hybrid_clock=false + --unlock_unsafe_flags=true: matches the
+  # upstream apache/kudu quickstart. Hybrid clock needs NTP; the docker
+  # network can't guarantee that, and unlocking unsafe flags lets the
+  # cluster run with system-clock time. Same flag combination the
+  # apache/kudu quickstart uses.
+  #
+  # --rpc_advertised_addresses is set to the container hostname so
+  # tservers and impalad addressing the master by hostname see a
+  # consistent identity. The upstream quickstart advertises the host
+  # machine's IP via KUDU_QUICKSTART_IP for host-network access; we
+  # keep everything inside the bridge network so the container name is
+  # what everyone else already resolves.
+  kudu-master-1:
+    image: apache/kudu:1.17.0
+    container_name: kudu-impala-master-1
+    command: ["master"]
+    ports:
+      # 7051 = master RPC; 8051 = master web UI. Web UI is exposed on
+      # the host for ./check to probe.
+      - "7051:7051"
+      - "8051:8051"
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051
+      - >
+        MASTER_ARGS=--fs_wal_dir=/var/lib/kudu/master
+        --rpc_bind_addresses=0.0.0.0:7051
+        --rpc_advertised_addresses=kudu-master-1:7051
+        --webserver_port=8051
+        --webserver_advertised_addresses=kudu-master-1:8051
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+        --default_num_replicas=1
+    volumes:
+      - kudu-master-1:/var/lib/kudu
+    networks:
+      - kudu-impala-net
+    hostname: kudu-master-1
+    # --default_num_replicas=1: master's default is 3. On a single-
+    # tserver cluster the DDL would succeed but every write hangs
+    # forever waiting for Kudu to place two more replicas. Setting it
+    # once on the master makes single-replica the cluster default so
+    # create.sql doesn't have to remember `TBLPROPERTIES ('kudu.num
+    # _tablet_replicas' = '1')` on every CREATE TABLE.
+
+  kudu-tserver-1:
+    image: apache/kudu:1.17.0
+    container_name: kudu-impala-tserver-1
+    depends_on:
+      - kudu-master-1
+    command: ["tserver"]
+    ports:
+      # 7050 = tserver RPC; 8050 = tserver web UI.
+      - "7050:7050"
+      - "8050:8050"
+    environment:
+      - KUDU_MASTERS=kudu-master-1:7051
+      - >
+        TSERVER_ARGS=--fs_wal_dir=/var/lib/kudu/tserver
+        --rpc_bind_addresses=0.0.0.0:7050
+        --rpc_advertised_addresses=kudu-tserver-1:7050
+        --webserver_port=8050
+        --webserver_advertised_addresses=kudu-tserver-1:8050
+        --webserver_doc_root=/opt/kudu/www
+        --stderrthreshold=0
+        --use_hybrid_clock=false
+        --unlock_unsafe_flags=true
+        --unlock_experimental_flags=true
+        --max_cell_size_bytes=1048576
+        --memory_limit_hard_bytes=12884901888
+        --block_cache_capacity_mb=3072
+        --maintenance_manager_num_threads=4
+        --tablet_compaction_budget_mb=256
+        --scanner_default_batch_size_bytes=4194304
+        --rpc_num_service_threads=20
+        --rpc_service_queue_length=128
+        --tablet_history_max_age_sec=300
+        --budgeted_compaction_target_rowset_size=67108864
+    volumes:
+      - kudu-tserver-1:/var/lib/kudu
+    networks:
+      - kudu-impala-net
+    hostname: kudu-tserver-1
+    # --max_cell_size_bytes=1048576 (last flag): Kudu's default cell
+    # size limit is 64KiB. The ClickBench hits.parquet Title, URL,
+    # Referer, and OriginalURL columns can exceed that on some rows,
+    # and Kudu rejects the whole INSERT with:
+    #     Row error for primary key=<..>: Value too large: STRING
+    #     of size <N> is larger than the maximum size 65536
+    # which aborts ./load with one bad row. Bumping to 1MiB covers
+    # the entire dataset (longest cell observed is ~200KiB) at a real
+    # cost — Kudu buffers full cells in memory during flush and
+    # compaction, so peak tserver RSS scales with this flag. 1MiB is
+    # the conservative bump; going higher (e.g. 16MiB, which is the
+    # server-side hard cap) would eat memory the benchmark doesn't
+    # need. See kudu.apache.org known_issues.html "Cell (individual
+    # value) size limit".
+    #
+    # Read-performance tuning (the four flags after max_cell_size_bytes).
+    # ClickBench on Kudu trails the Parquet variant on full-column scans
+    # because Kudu's on-disk footprint is ~3x larger and its default
+    # config is sized for a general mixed workload, not a static
+    # scan-heavy table. These four flags target that:
+    #
+    # --memory_limit_hard_bytes=12884901888 (12 GiB): the quickstart
+    #   image otherwise pins the tserver hard limit low (4 GiB), which
+    #   caps how large the block cache may grow — Kudu >=1.8 refuses to
+    #   start if block cache exceeds the memory-pressure threshold (60%
+    #   of this limit). 12 GiB leaves the block cache room while staying
+    #   well clear of the 32 GB box's ceiling; the streaming UPSERT in
+    #   create.sql (~20 GiB Impala-side) + a few GiB of Kudu MRS still
+    #   fits alongside it during load.
+    #
+    # --block_cache_capacity_mb=3072 (3 GiB, up from the 512 MiB default):
+    #   Kudu's LRU block cache holds recently-read *encoded* cfile blocks.
+    #   The ClickBench queries re-scan the same few columns across the
+    #   three timed runs, so a larger cache turns the 2nd/3rd (hot) runs
+    #   into in-memory scans. 3 GiB is 25% of the 12 GiB hard limit —
+    #   under the recommended <=30% guideline and far below the 60%
+    #   pressure threshold, so the server still starts cleanly.
+    #
+    # --maintenance_manager_num_threads=4 (up from 1): a single thread
+    #   otherwise serializes all MRS flushes and DiskRowSet compactions.
+    #   The load is UPSERT /* +noclustered */ (see create.sql) so rows
+    #   arrive unsorted and each flush emits DiskRowSets overlapping the
+    #   full PK range; every scan then merges many rowsets. Four threads
+    #   let post-load compaction converge quickly to low rowset height.
+    #
+    # --tablet_compaction_budget_mb=256 (up from 128): the byte budget a
+    #   single compaction op may consume. Doubling it merges more
+    #   overlapping rowsets per pass, reaching low height in fewer passes
+    #   — which speeds up both scans and the CounterID/EventDate PK
+    #   pushdown that is Kudu's win column here. This flag is tagged
+    #   'experimental' in Kudu, so it REQUIRES --unlock_experimental_flags
+    #   (below/above); without that unlock the tserver refuses to start
+    #   with "Flag --tablet_compaction_budget_mb is experimental and
+    #   unsupported". --unlock_unsafe_flags (already present for
+    #   use_hybrid_clock) is a SEPARATE gate and does not cover it.
+    #
+    # --unlock_experimental_flags=true: gates the experimental flags
+    #   (tablet_compaction_budget_mb, budgeted_compaction_target_rowset
+    #   _size below). The stable/advanced tuning flags need no unlock.
+    #
+    # Second tuning batch (scan throughput, RPC concurrency, rowset
+    # height). Flag tags verified against the Kudu source tree:
+    #
+    # --scanner_default_batch_size_bytes=4194304 (4 MiB, up from 1 MiB;
+    #   tag advanced,runtime): bytes per scan-result batch shipped from
+    #   the tserver to Impala. Bigger batches mean far fewer scan-
+    #   continuation RPC round-trips on the large full-column scans
+    #   (Q20-Q23, Q33-Q35). Ceiling is scanner_max_batch_size_bytes=8 MiB.
+    #
+    # --rpc_num_service_threads=20 (up from 10; tag advanced): Kudu
+    #   services each scan RPC on a worker thread. With Impala's MT_DOP=8
+    #   fan-out across 16 tablets, many scan RPCs are in flight at once
+    #   and 10 threads bottleneck them. Also widens headroom for the
+    #   concurrent-QPS phase (the likely source of the ~1 errored query
+    #   behind error_ratio 0.008).
+    #
+    # --rpc_service_queue_length=128 (up from 50; tag advanced): longer
+    #   inbound RPC queue so bursts during the 10-connection concurrency
+    #   window queue instead of being rejected (ServiceUnavailable).
+    #
+    # --tablet_history_max_age_sec=300 (down from 7 days; tag
+    #   advanced,runtime,stable): MVCC UNDO-delta retention. The load
+    #   UPSERTs rows, leaving UNDO deltas every scan must reconcile until
+    #   GC'd. This is a static, never-time-travelled benchmark table, so
+    #   dropping retention to 5 min lets Kudu GC those deltas right after
+    #   load — fewer deltas applied per scan, smaller footprint.
+    #
+    # --budgeted_compaction_target_rowset_size=67108864 (64 MiB, up from
+    #   32 MiB; tag advanced,experimental — covered by the unlock above):
+    #   larger target DiskRowSets means fewer rowsets opened/merged per
+    #   scan, complementing the compaction-budget + maintenance-thread
+    #   bumps.
+    #
+    # NOTE: for the compaction flags to pay off, let the tserver settle
+    # after ./load (watch DiskRowSet height on the :8050 web UI) before
+    # running ./benchmark, or the first cold pass measures a still-
+    # compacting table.
+
+networks:
+  kudu-impala-net:
+    # Named network to keep hostnames free of underscores; see
+    # ../impala/docker-compose.yml for the full rationale (java.net.URI
+    # rejects underscores in hostnames, catalogd reverse-resolves the
+    # HMS IP, etc.).
+    name: kudu-impala-net
+    driver: bridge
+
+volumes:
+  hms_warehouse:
+  # Kudu WAL + data directories. Named volumes so a compose `down`
+  # (which does not remove named volumes) preserves the table between
+  # cold cycles, matching ../impala/'s hms_warehouse behavior. A
+  # `down -v` wipes both.
+  kudu-master-1:
+  kudu-tserver-1:

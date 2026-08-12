@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Bind-mounted into /opt/hive/conf/hive-site.xml on the hms container.
+  See ../impala/hms-hive-site.xml for the full rationale. Registers
+  DbNotificationListener server-side so impalad's DDL RPCs to
+  get_current_notificationEventId succeed instead of failing with
+  TApplicationException, disables notification-API auth (impalad
+  connects unauthenticated), and turns on thrift-object serialization
+  for the notification API which Impala 4.x expects.
+-->
+<configuration>
+  <property>
+    <name>hive.metastore.transactional.event.listeners</name>
+    <value>org.apache.hive.hcatalog.listener.DbNotificationListener</value>
+  </property>
+  <property>
+    <name>hive.metastore.event.db.notification.api.auth</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>hive.metastore.notifications.add.thrift.objects</name>
+    <value>true</value>
+  </property>
+
+  <!--
+    Redirect the managed-table warehouse root out of the default
+    /user/hive/warehouse. Impala managed Kudu tables ask HMS to
+    create a *placeholder* directory even though the row data lives
+    in Kudu tablets, not on the HMS filesystem. HMS's default root
+    is /user/hive/warehouse, which doesn't exist inside the
+    quickstart HMS container, so the mkdir fails with:
+        MetaException: file:/user/hive/warehouse/clickbench.db/hits
+        is not a directory or unable to create one
+    /tmp is guaranteed world-writable inside the container. Kudu
+    tables never write real data here, so the location is cosmetic.
+    (The ../impala/ variant sidesteps this by giving its external
+    Parquet table an explicit LOCATION, which bypasses the
+    warehouse-dir default. Kudu tables can't take a LOCATION
+    clause, so we have to fix the default.)
+  -->
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>/tmp/hive/warehouse</value>
+  </property>
+</configuration>

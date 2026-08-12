@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Bind-mounted into /opt/impala/conf/hive-site.xml on the catalogd and
+  impalad-1 containers. See ../impala/hive-site.xml for the full
+  rationale — same file, same reason. Points hive.metastore.uris at
+  the separate `hms` compose service so the embedded HMS client in
+  each Impala daemon routes metastore calls through the proper thrift
+  HMS server instead of falling back to an in-process Derby.
+-->
+<configuration>
+  <property>
+    <name>hive.metastore.uris</name>
+    <value>thrift://hms:9083</value>
+  </property>
+</configuration>

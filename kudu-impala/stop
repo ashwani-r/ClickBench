@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# `down` (without -v) removes the containers but keeps the named
+# volumes: the HMS Derby store AND the Kudu master/tserver WAL+data
+# dirs. That means the metastore catalog and the Kudu tablets both
+# survive a cold cycle, so a warm re-./start does not need to re-CREATE
+# or re-LOAD the hits table.
+sudo docker compose -f docker-compose.yml down 2>/dev/null || true
+exit 0

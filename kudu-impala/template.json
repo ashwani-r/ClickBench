@@ -1,0 +1,13 @@
+{
+  "system": "Impala on Kudu",
+  "proprietary": "no",
+  "hardware": "cpu",
+  "tuned": "no",
+  "tags": [
+    "C++",
+    "MPP",
+    "column-oriented",
+    "stateful",
+    "Kudu"
+  ]
+}
